@@ -12,12 +12,28 @@
 
 (in-package :cl-prevalence)
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
 ;;; Domain Model
+;;;
+;;; In this demo, the domain model is particularly simple.  The root
+;;; object of a model is an instance of the class BANK.  A bank has a
+;;; set (represented as a hash table) of ACCOUNTS.  An account has an
+;;; ACCOUNT NUMBER which is an integer.  Account numbers are allocated
+;;; sequentially starting at 1.
 
 (defclass bank ()
   ((accounts-by-number :accessor get-accounts-by-number :initform (make-hash-table :test 'eql))
    (next-account-number :accessor get-next-account-number :initform 1)))
 
+;;; In addition to an account number, an account also has a HOLDER
+;;; which is a string that has no other interpretation.  The holder of
+;;; an account can be modified after the account has been created.
+;;; The BALANCE of the account is modified as a result of deposits and
+;;; withdrawals.  An account also has a TRANSACTION-HISTORY which is a
+;;; list of objects of type ACCOUNT-ENTRY.  Notice that the
+;;; transaction history of an account does not contain any
+;;; transactions in the sense of prevalence transactions.
 (defclass account ()
   ((number :accessor get-number :initarg :number :initform -1)
    (holder :accessor get-holder :initarg :holder :initform "Unspecified")
@@ -28,6 +44,8 @@
   (with-slots (number holder balance) account
     (format stream "#<ACCOUNT ~d '~a' $~d>" number holder balance)))
 
+;;; Whenever the balance of an account is modified, an instance of
+;;; ACCOUNT-ENTRY is pushed on the transaction history of the account.
 (defclass account-entry ()
   ((amount :accessor get-amount :initarg :amount)
    (timestamp :accessor get-timestamp :initarg :timestamp)))
@@ -43,22 +61,89 @@
   (with-slots (timestamp amount) account-entry
     (format stream "#<ACCOUNT-ENTRY ~a ~@d>" (date-time->string timestamp) amount)))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
 ;;; Prevalence System
+;;;
+;;; A prevalence system is represented by an instance of the class
+;;; CL-PREVALENCE:PREVALENCE-SYSTEM or a subclass of that class.  Such
+;;; a system contains a collection of root objects which are objects
+;;; that can not be reached from any other objects, and from which
+;;; every object in the domain model can be reached.  The root objects
+;;; are accessed through unique keys.  Keys are compared using EQ.
+;;;
+;;; In this demo, a BANK is a root object, whereas an ACCOUNT is not
+;;; because an account can be found by searching the hash table of a
+;;; bank.  In this demo, there is a single root object, and its key is
+;;; the keyword :BANK.
+;;;
+;;; The model must not be modified directly.  Instead, all
+;;; modifications to model objects must be done by using TRANSACTIONS.
+;;; A transaction is an instance of the class
+;;; CL-PREVALENCE:TRANSACTION.  Such an instance contains the name of
+;;; a function to be called in order to modify the model objects, and
+;;; the arguments to that function, except that the first argument
+;;; that will be given to the function is the prevalence system, and
+;;; that is not part of the arguments stored in the transaction.
+;;; Instead, the prevalence system is supplied to the EXECUTE
+;;; function, which takes a prevalence system and a transaction as
+;;; arguments.  Transactions must be serializable so that they can be
+;;; stored in a transaction log in a file.  For that reason, it is
+;;; important to store the NAME of a function, rather than the
+;;; function itself.  Also, the arguments to a transaction must be
+;;; serializable for the same reason.
 
+;;; A prevalence system is associated with a location which is a
+;;; directory.  This directory contains the transaction logs and the
+;;; snapshots of the system. 
 (defparameter *bank-system-location* (pathname "/tmp/demo2-prevalence-system/"))
 
+;;; This function is called as a result of calling EXECUTE on a
+;;; transaction.  A transaction created using this function should not
+;;; contain any arguments.  As a consequence, this function is called
+;;; only with the prevalence system that was supplied to the EXECUTE
+;;; function
 (defun tx-create-bank (system)
   (setf (get-root-object system :bank) (make-instance 'bank)))
 
+;;; Initialize the bank system.  A single bank is stored in the
+;;; system, and this function checks whether a bank has already been
+;;; stored, and if not, creates and stores a new instance of the class
+;;; BANK.  A bank will already exist in the system if the system
+;;; already existed as a combination of snapshots and transaction logs
+;;; in the directory that was passed to MAKE-PREVALENCE-SYSTEM.  
 (defun init-bank-system (system)
   (unless (get-root-object system :bank)
     (execute system (make-transaction 'tx-create-bank)))
   system)
 
+;;; Create a prevalence system associated with a directory.  If there
+;;; is already a system stored there, then restore it by deserializing
+;;; it, which will recreate the system as it was after the last
+;;; transaction that was executed.  If not, a new system will be
+;;; created.  Make sure that either way, the system has a single BANK
+;;; instance in it.  
 (defvar *bank-system*
   (let ((system (make-prevalence-system *bank-system-location*)))
     (init-bank-system system)))
 
+;;; This function is called as a result of calling EXECUTE on a
+;;; transaction.  A transaction created using this function should
+;;; contain a list of a single argument, namely the holder of the
+;;; account to be created.  The holder is not interpreted in any way,
+;;; and just stored in a slot of the account, but the object used to
+;;; represent the holder should be serializable, because transactions
+;;; must be serializable.
+;;;
+;;; Since the model in this demo contains a single bank, the bank is
+;;; implicit so it is not an argument to this transaction.  Instead
+;;; the only bank object is found in the system as a root object with
+;;; the key :BANK.  A new account number is allocated by taking the
+;;; next available account number stored in the bank object.  
+;;;
+;;; The new account is returned by this function, but it is also
+;;; stored in the set of all accounts in the bank object.  That set is
+;;; a hash table with the account number as a key. 
 (defun tx-create-account (system holder)
   (let* ((bank (get-root-object system :bank))
 	 (account-number (get-next-account-number bank))
@@ -85,6 +170,12 @@
 		     (overdrawn-account-amount condition)
 		     (overdrawn-account-account condition)))))
 
+;;; This function is a helper function to be used in several
+;;; transactions.  It takes a prevalence system containing a single
+;;; bank object and an account number, and returns the account with
+;;; that number in the bank object.  An error is signaled when there
+;;; is no account with that number in the bank, so this function is
+;;; also used just to check that the account exists. 
 (defun get-account (system account-number)
   (let* ((bank (get-root-object system :bank))
 	 (account (gethash account-number (get-accounts-by-number bank))))
@@ -92,6 +183,16 @@
 	account
       (error 'unknown-account :account-number account-number))))
 
+;;; This function is called as a result of calling EXECUTE on a
+;;; transaction.  A transaction created using this function should
+;;; contain a list of a single argument, namely the account number of
+;;; the account that should be deleted.  The function GET-ACCOUNT is
+;;; called just to check that the account exists (an error is signaled
+;;; otherwise).  This function works by finding the single bank in the
+;;; prevalence system, then it accesses the set of all the accounts in
+;;; that bank (which is a hash table with the account number as a
+;;; key), and finally it removes that account from the set of all
+;;; accounts.
 (defun tx-delete-account (system account-number)
   (when (get-account system account-number)
     (remhash account-number (get-accounts-by-number (get-root-object system :bank)))))
@@ -139,7 +240,14 @@
 	     (get-accounts-by-number bank))
     total))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
 ;;; Client Interface
+;;;
+;;; This is a collection of functions to be used by application (or
+;;; client) code.  Such code is not allowed to modify model objects
+;;; directly.  Instead it does so indirectly by creating transactions
+;;; that can be logged.
 
 (defun create-account (holder)
   (execute *bank-system* (make-transaction 'tx-create-account holder)))
@@ -162,6 +270,8 @@
   (execute *bank-system* (make-transaction 'tx-transfer
 					   from-account-number to-account-number amount (get-universal-time))))
 
+;;; Client code that does not make any modifications to model objects
+;;; are not required to use transactions.  
 (defun find-account (account-number)
   (let ((bank (get-root-object *bank-system* :bank)))
     (gethash account-number (get-accounts-by-number bank))))
